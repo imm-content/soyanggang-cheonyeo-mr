@@ -25,8 +25,9 @@ scene.add(new THREE.HemisphereLight(0xffffff,0x526079,2.5));const sun=new THREE.
 const grid=new THREE.GridHelper(8,16,0x577a9a,0x395065);scene.add(grid);
 const controls=new OrbitControls(camera,renderer.domElement);controls.enableDamping=true;controls.enableRotate=false;controls.enablePan=false;controls.target.set(0,.8,0);controls.minDistance=.35;controls.maxDistance=12;
 const modelRoot=new THREE.Group();scene.add(modelRoot);
-let model=null,baseScale=1,placed=false,hitSource=null,viewerSpace=null,arSession=null,hasSurface=false;
-const reticle=new THREE.Mesh(new THREE.RingGeometry(.09,.12,32).rotateX(-Math.PI/2),new THREE.MeshBasicMaterial({color:0x00e6b8,side:THREE.DoubleSide}));reticle.matrixAutoUpdate=false;reticle.visible=false;scene.add(reticle);
+let model=null,baseScale=1,placed=false,hitSource=null,arSession=null;
+let initializing=false,starting=false,nextRetry=0,attempts=0,scanStarted=0,lastNotice=0;
+const reticle=new THREE.Mesh(new THREE.RingGeometry(.09,.125,64).rotateX(-Math.PI/2),new THREE.MeshBasicMaterial({color:0x00ff00,side:THREE.DoubleSide,depthTest:false,depthWrite:false}));reticle.matrixAutoUpdate=false;reticle.frustumCulled=false;reticle.renderOrder=999;reticle.visible=false;scene.add(reticle);
 const loader=new GLTFLoader();
 loader.load('./soyanggang-cheonyeo.glb',g=>{
  model=g.scene;modelRoot.add(model);
@@ -38,20 +39,61 @@ loader.load('./soyanggang-cheonyeo.glb',g=>{
  modelRoot.position.set(0,0,0);controls.target.set(0,.5,0);controls.update();
  status.textContent='모델 준비 완료 · 한 손가락으로 동상을 좌우 회전해 보세요.';start.disabled=false;
  },undefined,e=>{error.textContent='GLB 로딩 실패: 파일명·저장 위치를 확인하세요.';status.textContent='모델을 불러오지 못했습니다.';console.error(e)});
+function clearHitSource(){
+ if(hitSource){try{hitSource.cancel();}catch(e){console.warn(e);}hitSource=null;}
+}
+function restorePreview(session){
+ if(arSession!==session)return;
+ arSession=null;clearHitSource();initializing=false;placed=false;reticle.visible=false;
+ scene.background=new THREE.Color(0x172735);grid.visible=true;controls.enabled=true;
+ modelRoot.visible=true;modelRoot.position.set(0,0,0);
+ start.textContent='AR 시작';status.textContent='일반 3D 보기';
+}
+async function initializeHitTest(session){
+ initializing=true;attempts++;
+ status.textContent=`공간 인식 초기화 중… (${attempts}회)`;
+ try{
+  const space=await session.requestReferenceSpace('viewer');
+  const source=await session.requestHitTestSource({space});
+  if(arSession!==session){source.cancel();return;}
+  hitSource=source;scanStarted=performance.now();lastNotice=0;error.textContent='';
+  status.textContent='공간 인식 준비 완료 · 책상이나 바닥을 천천히 비추세요.';
+ }catch(e){
+  if(arSession!==session)return;
+  console.error(e);nextRetry=performance.now()+2000;
+  status.textContent=`공간 인식 초기화 실패 (${e.name||'오류'}) · 2초 후 재시도`;
+ }finally{if(arSession===session)initializing=false;}
+}
 async function beginAR(){
+ if(starting)return;
  if(!navigator.xr){alert('이 브라우저는 WebXR을 지원하지 않습니다. Android Chrome에서 HTTPS 주소로 열어 주세요.');return;}
+ starting=true;start.disabled=true;error.textContent='';
+ let session=null;
  try{
   if(!await navigator.xr.isSessionSupported('immersive-ar')){alert('이 기기 또는 브라우저에서 WebXR AR을 사용할 수 없습니다.');return;}
-  arSession=await navigator.xr.requestSession('immersive-ar',{requiredFeatures:['hit-test'],optionalFeatures:['dom-overlay','local-floor'],domOverlay:{root:document.body}});
-  await renderer.xr.setSession(arSession);scene.background=null;grid.visible=false;controls.enabled=false;modelRoot.visible=false;placed=false;hasSurface=false;reticle.visible=false;
-  viewerSpace=await arSession.requestReferenceSpace('viewer');hitSource=await arSession.requestHitTestSource({space:viewerSpace});
-  arSession.addEventListener('select',()=>{if(!placed&&reticle.visible){modelRoot.position.setFromMatrixPosition(reticle.matrix);modelRoot.visible=true;placed=true;reticle.visible=false;status.textContent='배치 완료 · 한 손가락 회전 / 두 손가락 확대·축소';}});
-  arSession.addEventListener('end',()=>{arSession=null;hitSource?.cancel();hitSource=null;scene.background=new THREE.Color(0x172735);grid.visible=true;controls.enabled=true;modelRoot.visible=true;modelRoot.position.set(0,0,0);reticle.visible=false;start.textContent='AR 시작';status.textContent='일반 3D 보기';});
-  start.textContent='AR 종료';status.textContent='바닥 인식 중… 스마트폰을 천천히 좌우로 움직여 주세요.';
- }catch(e){console.error(e);error.textContent='AR 시작 실패: '+e.message;}
+  session=await navigator.xr.requestSession('immersive-ar',{requiredFeatures:['hit-test'],optionalFeatures:['dom-overlay','local-floor'],domOverlay:{root:document.body}});
+  arSession=session;initializing=false;nextRetry=0;attempts=0;scanStarted=performance.now();lastNotice=0;
+  session.addEventListener('end',()=>restorePreview(session),{once:true});
+  session.addEventListener('select',()=>{
+   if(arSession===session&&!placed&&reticle.visible&&model){
+    modelRoot.position.setFromMatrixPosition(reticle.matrix);modelRoot.visible=true;placed=true;reticle.visible=false;
+    status.textContent='배치 완료 · 한 손가락 회전 / 두 손가락 확대·축소';
+   }
+  });
+  scene.background=null;grid.visible=false;controls.enabled=false;modelRoot.visible=false;placed=false;reticle.visible=false;
+  await renderer.xr.setSession(session);
+  if(arSession!==session)return;
+  start.textContent='AR 종료';status.textContent='공간 인식 준비 중…';
+ }catch(e){
+  console.error(e);
+  if(session&&arSession===session){try{await session.end();}catch(endError){console.warn(endError);}restorePreview(session);}
+  error.textContent='AR 시작 실패: '+e.message;
+ }finally{starting=false;start.disabled=!model;}
 }
-start.addEventListener('click',async()=>{if(arSession)await arSession.end();else await beginAR()});
-reset.addEventListener('click',()=>{if(arSession){placed=false;hasSurface=false;reticle.visible=false;modelRoot.visible=false;status.textContent='재배치: 바닥을 천천히 비춰 주세요.';}else{modelRoot.rotation.set(0,0,0);modelRoot.scale.setScalar(baseScale);controls.reset();status.textContent='회전과 크기를 초기화했습니다.';}});
+start.addEventListener('click',async()=>{if(starting)return;if(arSession){try{await arSession.end();}catch(e){error.textContent='AR 종료 실패: '+e.message;}}else await beginAR();});
+reset.addEventListener('click',()=>{if(arSession){placed=false;reticle.visible=false;modelRoot.visible=false;scanStarted=performance.now();lastNotice=0;status.textContent='재배치: 책상이나 바닥을 천천히 비춰 주세요.';}else{modelRoot.rotation.set(0,0,0);modelRoot.scale.setScalar(baseScale);controls.reset();status.textContent='회전과 크기를 초기화했습니다.';}});
+// 버튼 조작이 XR 배치 이벤트로 전달되지 않도록 차단.
+document.querySelector('#toolbar').addEventListener('beforexrselect',e=>e.preventDefault());
 // AR DOM Overlay에서만 한 손가락 수평 드래그로 Y축 회전, 두 손가락으로 크기 변경.
 // 버튼 위 터치는 제외하여 AR 종료/재배치를 방해하지 않는다.
 let pinchStart=null,scaleStart=1,lastX=null;
@@ -84,7 +126,33 @@ document.addEventListener('touchmove',e=>{
 },{passive:false});
 document.addEventListener('touchend',()=>{pinchStart=null;lastX=null},{passive:true});
 renderer.setAnimationLoop((t,frame)=>{
- if(arSession&&frame&&hitSource&&!placed){const hits=frame.getHitTestResults(hitSource);if(hits.length){const pose=hits[0].getPose(renderer.xr.getReferenceSpace());if(pose){reticle.visible=true;reticle.matrix.fromArray(pose.transform.matrix);if(!hasSurface){hasSurface=true;status.textContent='바닥 인식 완료 · 녹색 원이 보이면 화면을 터치하세요.';}}}else{reticle.visible=false;if(hasSurface){hasSurface=false;status.textContent='바닥을 다시 찾는 중… 천천히 움직여 주세요.';}}}
+ if(arSession&&frame&&renderer.xr.getSession()===arSession&&!placed){
+  const now=performance.now();
+  if(!hitSource&&!initializing&&now>=nextRetry)initializeHitTest(arSession);
+  if(hitSource){
+   let count=0,pose=null;
+   try{
+    const hits=frame.getHitTestResults(hitSource);count=hits.length;
+    const space=renderer.xr.getReferenceSpace();
+    if(count&&space)pose=hits[0].getPose(space);
+   }catch(e){
+    console.error(e);clearHitSource();nextRetry=now+2000;
+    status.textContent='공간 인식 오류 · 2초 후 다시 연결합니다.';
+   }
+   const wasVisible=reticle.visible;reticle.visible=!!pose;
+   if(pose){
+    reticle.matrix.fromArray(pose.transform.matrix);reticle.matrixWorldNeedsUpdate=true;
+    if(!wasVisible||now-lastNotice>=1000){status.textContent=`표면 인식 완료 (${count}건) · 녹색 원이 보이면 화면을 터치하세요.`;lastNotice=now;}
+   }else if(hitSource&&(wasVisible||now-lastNotice>=1000)){
+    if(wasVisible)scanStarted=now;
+    const seconds=Math.floor((now-scanStarted)/1000);
+    status.textContent=count>0?`표면 후보 ${count}건 · 유효한 위치 정보 대기 중 (${seconds}초)`:
+     seconds>=15?`표면 인식 대기 ${seconds}초 (0건) · 밝은 곳에서 무늬 있는 책상이나 바닥을 천천히 비추세요.`:
+     `표면 인식 중… ${seconds}초 (0건) · 스마트폰을 천천히 움직여 주세요.`;
+    lastNotice=now;
+   }
+  }
+ }
  if(!arSession)controls.update();renderer.render(scene,camera);
 });
 addEventListener('resize',()=>{camera.aspect=innerWidth/innerHeight;camera.updateProjectionMatrix();renderer.setSize(innerWidth,innerHeight)});
